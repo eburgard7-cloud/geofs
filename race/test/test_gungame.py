@@ -1,6 +1,6 @@
 """Gun Game (proto 14): the pure engine (gungame_engine.py) and its relay wiring in app.py.
 
-Run: cd race/server && RACE_DB=/tmp/race-test.db python -m pytest ../test/test_gungame.py -q
+Run: cd race/server && python -m pytest ../test/test_gungame.py -q
 """
 import contextlib
 import copy
@@ -13,7 +13,6 @@ import time as _time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
@@ -355,6 +354,7 @@ def _pilots(c, room, names, proto=None, tokens=None):
 
 def _course_ids(n=3):
     """Ground-start courses: a leg always arms a plain countdown (never FORMATION)."""
+    appmod.refresh_courses()             # the catalog loads at startup: a test that asks first still sees it
     return [c["course_id"] for c in appmod.COURSES if c["start_type"] == "ground"][:n]
 
 

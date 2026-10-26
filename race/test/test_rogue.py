@@ -1,6 +1,6 @@
 """Roguelike Cup (proto 13): the upgrade catalog, the pure run engine, and the relay glue.
 
-Run: cd race/server && RACE_DB=/tmp/race-test.db python -m pytest ../test/test_server.py ../test/test_dash.py ../test/test_rogue.py -q
+Run: cd race/server && python -m pytest ../test/test_server.py ../test/test_dash.py ../test/test_rogue.py -q
 """
 import contextlib
 import datetime as _dt
@@ -13,7 +13,6 @@ import time as _time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
@@ -387,6 +386,7 @@ def _pilots(c, room, names, proto=None):
 def _course_ids(n=3):
     """Ground-start courses: the relay never offers those a rolling start, so a leg always arms a
     plain countdown (an air-start leg may go to FORMATION, which is the gate race's business)."""
+    appmod.refresh_courses()             # the catalog loads at startup: a test that asks first still sees it
     return [c["course_id"] for c in appmod.COURSES if c["start_type"] == "ground"][:n]
 
 
@@ -454,7 +454,7 @@ def test_rogue_off_when_the_catalog_is_invalid(monkeypatch):
         assert "the roguelike cup is off on this server" in _errors(_drain(w["Host"]))
 
 
-def test_a_two_pilot_three_leg_run_end_to_end(fast):
+def test_a_two_pilot_three_leg_run_end_to_end(fast, race_db):
     ids = _course_ids()
     room = "rogue-e2e-" + uuid.uuid4().hex[:8]
     with TestClient(appmod.app) as c, _pilots(c, room, ["Eric", "Maggie", "Old"], proto={"Old": 10}) as w:

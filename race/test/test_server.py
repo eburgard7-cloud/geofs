@@ -1,10 +1,9 @@
-"""Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
+"""Run: cd race/server && RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
 import datetime as _dt
 import hashlib
 import json
 import sqlite3
-os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
@@ -12,7 +11,6 @@ os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_TILE_WARM", "0")
 os.environ.setdefault("RACE_THUMB_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
-if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 import pytest
 from fastapi.testclient import TestClient
