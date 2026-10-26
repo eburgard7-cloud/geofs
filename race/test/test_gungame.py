@@ -690,3 +690,38 @@ def test_an_unlisted_model_needs_no_career_unlock(tmp_path):
     assert appmod._model_ids(str(tmp_path)) == {"a", "c"}
     with TestClient(appmod.app):
         assert appmod.CAMPAIGN_PROBLEMS == [] and appmod.CAMPAIGN is not None
+
+
+def test_a_crafted_frame_cannot_put_the_gold_toilet_on_anyone_outside_a_final_tier(fast):
+    """The gold toilet is unlisted (a mode's to wear). The only frame another client turns into a joke
+    model is the server-built `gg` card, and the card gives it to a final-tier toilet only."""
+    room = "gg-gold-" + uuid.uuid4().hex[:8]
+    with TestClient(appmod.app) as c, _pilots(c, room, ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms[room]
+        _drain(w["Maggie"])
+        # Outside a game: a hello label, the card and catalog frames forged by a client, and every
+        # staging frame produce no card for anyone.
+        w["Eric"].send_json({"type": "hello", "model": "toilet-gold"})
+        for forged in ({"type": "gg", "phase": "leg", "ladder": [{"name": "Toilet", "model": "toilet-gold"}]},
+                       {"type": "gg_catalog", "airframes": {"toilet": {"model": "toilet-gold"}}},
+                       {"type": "gg_leg", "rows": []}, {"type": "model", "model": "toilet-gold"},
+                       {"type": "gg_settings", "custom": [{"airframe": "toilet", "model": "toilet-gold"}, {"airframe": "f16"}]},
+                       {"type": "gg_vote", "preset": "custom"}, {"type": "gg_ready", "ready": True}):
+            w["Eric"].send_json(forged)
+        assert len(_errors(_drain(w["Eric"]))) == 7, "each is refused: unknown to the relay, or no game is on"
+        assert rm.gg is None
+        seen = _drain(w["Maggie"])
+        assert not [f for f in seen if f["type"].startswith("gg")], "no pilot is sent a card or a ladder"
+        assert not [t for f in seen for t in (f.get("ladder") or [])], seen
+        # Inside a game: tier extras a client invents are dropped, and only the last tier is gold.
+        w["Eric"].send_json({"type": "gg_create"})
+        w["Eric"].send_json({"type": "gg_settings", "custom": [
+            {"airframe": "f16", "model": "toilet-gold", "final_model": "toilet-gold", "fallback_model": "toilet-gold"},
+            {"aircraft_id": "3", "name": "Bombardier Dash 8", "model": "toilet-gold"},
+            {"airframe": "toilet", "model": "cub"}]})
+        assert not _errors(_drain(w["Eric"]))
+        w["Eric"].send_json({"type": "gg_vote", "preset": "custom"})
+        w["Maggie"].send_json({"type": "gg_vote", "preset": "custom"})
+        card = _of(_drain(w["Maggie"]), "gg")[-1]
+        assert [(t["name"], t["model"], t["fallback_model"]) for t in card["ladder"]] == [
+            ("F-16", None, None), ("Bombardier Dash 8", None, None), ("Toilet", "toilet-gold", "toilet-gold")]
