@@ -9472,6 +9472,22 @@ async function main() {
     GG.editDraft((x) => { x.length = 0; x.push({ airframe: 'f16' }, { aircraft_id: '3', name: 'Bombardier Dash 8' }, { airframe: 'toilet' }); });
     ok(/Bombardier Dash 8 \(stock paint\)/.test(box.textContent), 'a searched aircraft is flagged: stock paint');
     ok(GG.saveDraft() === true && ws.ofType('gg_settings').some((f) => f.custom && f.custom.length === 3) && ws.ofType('gg_vote').some((f) => f.preset === 'custom'), 'Save sends the ladder and votes Custom');
+    // A card update (a pilot readies up) mid-typing rebuilds the card body: the search box keeps focus, value and caret.
+    box.querySelector('.fr-gg-builder').open = true;
+    const q1 = box.querySelector('input[type="search"]');
+    q1.focus();
+    q1.value = 'dash 8';
+    q1.dispatchEvent(new E.w.Event('input', { bubbles: true }));
+    q1.setSelectionRange(2, 4);
+    ws.fireMessage(ggCard('classic', { pilots: [{ callsign: 'Eric', tier: 1, ready: false }, { callsign: 'Maggie', tier: 1, ready: false }] }));
+    const q2 = box.querySelector('input[type="search"]');
+    ok(q2 && q2 !== q1 && !q1.isConnected, 'the card update rebuilt the search box');
+    ok(box.querySelector('.fr-gg-builder').open, '...and left the builder open');
+    ok(E.w.document.activeElement === q2 && q2.value === 'dash 8', '...and the new one has focus and the typed text');
+    ok(q2.selectionStart === 2 && q2.selectionEnd === 4, '...and the caret/selection where it was: ' + q2.selectionStart + '-' + q2.selectionEnd);
+    E.w.document.activeElement.blur();
+    ws.fireMessage(ggCard('classic', { pilots: [{ callsign: 'Eric', tier: 1, ready: false }, { callsign: 'Maggie', tier: 1, ready: true }] }));
+    ok(E.w.document.activeElement !== box.querySelector('input[type="search"]'), 'an unfocused search box is not given focus by an update');
     const ready = [...box.querySelectorAll('button')].find((b) => b.textContent === 'Ready');
     ready.click();
     ok(ws.ofType('gg_ready')[0] && ws.ofType('gg_ready')[0].ready === true, 'Ready sends gg_ready');

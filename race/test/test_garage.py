@@ -1,12 +1,11 @@
 """Liveries and the Garage (server 1.9.0, relay proto 12): packaging, serving, identity, equips,
 unlocks, recolor, uploads, admin review and the relay's livery frames.
 
-Run: cd race/server && RACE_DB=/tmp/race-test.db python -m pytest ../test/test_server.py ../test/test_dash.py ../test/test_garage.py -q
+Run: cd race/server && python -m pytest ../test/test_server.py ../test/test_dash.py ../test/test_garage.py -q
 """
 import os, sys
 import hashlib
 import json
-os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")

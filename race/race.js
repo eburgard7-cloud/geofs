@@ -20307,7 +20307,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   const GunGame = {
     state: ggInitialState(), E: {}, built: false, notedFor: '', resolved: null, resolvedFor: null,
     hidden: false, prep: null, prepKey: '', paintKeys: new Set(), styled: new Set(), syncKey: '', lastSync: 0,
-    draft: null, search: '', homeAircraftId: null, swapNoted: false, summaryOpen: false,
+    draft: null, builderOpen: false, search: '', homeAircraftId: null, swapNoted: false, summaryOpen: false,
     on() { return !!(CONFIG.GUNGAME && CONFIG.ROGUE && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
     live() { return this.on() && Lobby.proto >= GG_PROTO; },
     active() { return this.live() && !!this.state.phase && this.state.phase !== 'over'; },
@@ -20503,7 +20503,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const d = this.draftTiers(), why = ggValidateCustom(d, this.state.catalog);
       if (why) { try { Shell.toast(why, 'warn'); } catch (_) {} return false; }
       const ok = this.settings({ custom: d });
-      if (ok) { this.draft = null; this.vote('custom'); }
+      if (ok) { this.draft = null; this.builderOpen = false; this.vote('custom'); }
       return ok;
     },
     tierLabel(t) {
@@ -20585,11 +20585,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const sel = h('select', { 'aria-label': 'Add an airframe' }, ...Object.entries(cat.airframes).map(([k, a]) => h('option', { value: k, text: a.label || k })));
       const results = h('div', { class: 'fr-gg-search' }, ...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
         h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name })));
-      const q = h('input', { type: 'search', placeholder: 'Search GeoFS aircraft', value: this.search, 'aria-label': 'Search aircraft by name',
+      const q = h('input', { type: 'search', placeholder: 'Search GeoFS aircraft', value: this.search, 'aria-label': 'Search aircraft by name', 'data-fr-gg': 'search',
         oninput: (ev) => { this.search = String(ev.target.value || '').slice(0, 40); results.replaceChildren(...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
           h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name }))); } });
       const why = ggValidateCustom(d, cat);
-      return h('details', { class: 'fr-gg-builder', open: this.draft ? 'open' : null }, h('summary', { text: 'Build a custom ladder (2-16 tiers)' }),
+      return h('details', { class: 'fr-gg-builder', open: this.draft || this.builderOpen ? 'open' : null }, h('summary', { text: 'Build a custom ladder (2-16 tiers)' }),
         h('ol', null, ...rows),
         h('div', { class: 'fr-row' }, sel, h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ airframe: sel.value })), text: 'Add' })),
         h('div', { class: 'fr-row' }, q), results,
@@ -20633,7 +20633,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (showSummary) { E.title.textContent = 'Gun Game · ' + s.summary.legsDone + ' legs'; E.body.replaceChildren(...this.summaryNodes()); return; }
         if (!showCard) return;
         E.title.textContent = s.phase === 'staging' ? 'Gun Game · set the ladder' : 'Gun Game · next leg';
+        // A card update rebuilds the body; the open builder and the search box (focus, caret) survive it.
+        const det = E.body.querySelector('.fr-gg-builder');
+        if (det) this.builderOpen = det.open;
+        const ae = document.activeElement, typing = ae && ae.getAttribute && ae.getAttribute('data-fr-gg') === 'search' && E.body.contains(ae)
+          ? { start: ae.selectionStart, end: ae.selectionEnd, dir: ae.selectionDirection } : null;
         E.body.replaceChildren(...(s.phase === 'staging' ? this.stagingNodes() : this.voteNodes()));
+        const box = typing && E.body.querySelector('[data-fr-gg="search"]');
+        if (box) { try { box.focus(); box.setSelectionRange(typing.start, typing.end, typing.dir || 'none'); } catch (_) {} }
       } catch (e) { console.warn('[finsRace] gun game render', e); }
     },
     // HUD: my tier badge (tier, plane, heat colour) and the ladder strip (everyone's position).

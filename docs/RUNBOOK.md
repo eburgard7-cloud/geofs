@@ -1181,7 +1181,7 @@ CLAUDE.md requires both core suites before every commit:
 
 ```bash
 cd race/test && npm install && node run.js                     # JS: engine, UI, relay client
-cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q
+cd race/server && pip install -r requirements-test.txt && python -m pytest ../test/test_server.py -q
 ```
 
 The rest, when you touch their area:
